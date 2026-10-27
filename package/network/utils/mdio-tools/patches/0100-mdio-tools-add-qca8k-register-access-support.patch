@@ -1,0 +1,178 @@
+From 6a675b778aa44a76958fa847e7644d11c53b40a0 Mon Sep 17 00:00:00 2001
+From: Alexander Vickberg <wickbergster@gmail.com>
+Date: Sat, 14 Mar 2026 15:50:34 +0100
+Subject: [PATCH] mdio-tools: add qca8k register access support
+
+QCA8337 switch registers are 32-bit wide but the MDIO bus only
+transfers 16 bits at a time. Add hi/lo subcommands that perform
+two MDIO operations per register access to read or write the full
+32-bit value.
+
+Example reading PORT6_STATUS (0x0094):
+  mdio 37000000.mdio-mii qca8k hi 0x0094   # upper 16 bits
+  mdio 37000000.mdio-mii qca8k lo 0x0094   # lower 16 bits
+
+Signed-off-by: Alexander Vickberg <wickbergster@gmail.com>
+---
+ src/mdio/Makefile.am |   2 +-
+ src/mdio/ar8327.c    | 136 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 137 insertions(+), 1 deletion(-)
+ create mode 100644 src/mdio/ar8327.c
+
+diff --git a/src/mdio/Makefile.am b/src/mdio/Makefile.am
+index 96cb4ad..da73707 100644
+--- a/src/mdio/Makefile.am
++++ b/src/mdio/Makefile.am
+@@ -1,6 +1,6 @@
+ sbin_PROGRAMS = mdio
+ 
+-mdio_SOURCES = bus.c main.c mdio.c mdio.h mva.c mvls.c phy.c print_phy.c xrs.c
++mdio_SOURCES = bus.c main.c mdio.c mdio.h mva.c mvls.c phy.c print_phy.c xrs.c ar8327.c
+ mdio_CFLAGS  = -Wall -Wextra -Werror -Wno-unused-parameter -I $(top_srcdir)/include $(mnl_CFLAGS)
+ mdio_LDFLAGS = -T $(top_srcdir)/src/mdio/cmds.ld
+ mdio_LDADD   = $(mnl_LIBS)
+diff --git a/src/mdio/ar8327.c b/src/mdio/ar8327.c
+new file mode 100644
+index 0000000..68bd5f3
+--- /dev/null
++++ b/src/mdio/ar8327.c
+@@ -0,0 +1,136 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * AR8327/QCA8337 register access driver for mdio-tools
++ *
++ * The AR8327 exposes its 32-bit internal registers over a two-step
++ * Clause 22 MDIO sequence (section 2.8 of the AR8327 datasheet):
++ *
++ *   Step 1 - high-address write
++ *     Write page = reg[17:9]  to  PHY 0x18, MDIO reg 0.
++ *
++ *   Step 2 - one 16-bit data read or write
++ *     PHY address = 0x10 | r2   where r2 = reg[8:6]
++ *     MDIO reg    = r1          where r1 = reg[5:2] << 1  (even = low half)
++ *                   r1 + 1                                (odd  = high half)
++ *
++ * Each internal register is 32-bit. Because mdio-tools only returns one
++ * 16-bit result per invocation, the half to access is selected by an
++ * optional 'hi' or 'lo' argument (default: lo):
++ *
++ *   mdio <BUS> ar8327 lo raw 0x00e0   -> Data[15:0]  of SGMII_CTRL
++ *   mdio <BUS> ar8327 hi raw 0x00e0   -> Data[31:16] of SGMII_CTRL
++ *   mdio <BUS> ar8327 raw 0x00e0      -> Data[15:0]  (lo is default)
++ */
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <linux/mdio.h>
++
++#include "mdio.h"
++
++#define AR8327_HIGH_ADDR_PHY    0x18
++#define AR8327_HIGH_ADDR_REG    0x00
++#define AR8327_DATA_PHY_BASE    0x10
++
++struct ar8327_device {
++	struct mdio_device dev;
++	int high_half;  /* 0 = Data[15:0], 1 = Data[31:16] */
++};
++
++/*
++ * ar8327_split_addr - decompose a 4-byte-aligned register address into the
++ * three MDIO fields, mirroring qca8k_split_addr() in
++ * drivers/net/dsa/qca/qca8k-8xxx.c:
++ *
++ *   regaddr >>= 1;  r1   = regaddr & 0x1e   -- bits [5:2] → MDIO regad
++ *   regaddr >>= 5;  r2   = regaddr & 0x07   -- bits [8:6] → PHYAD offset 0-7
++ *   regaddr >>= 3;  page = regaddr & 0x3ff  -- bits [17:9] → 10-bit page
++ *
++ */
++static void ar8327_split_addr(uint32_t reg,
++			      uint16_t *r1, uint16_t *r2, uint16_t *page)
++{
++	reg >>= 1;
++	*r1   = reg & 0x1e;
++
++	reg >>= 5;
++	*r2   = reg & 0x07;
++
++	reg >>= 3;
++	*page = reg & 0x3ff;
++}
++
++int ar8327_read(struct mdio_device *dev, struct mdio_prog *prog, uint32_t reg)
++{
++	struct ar8327_device *adev = (void *)dev;
++	uint16_t r1, r2, page;
++
++	ar8327_split_addr(reg, &r1, &r2, &page);
++
++	mdio_prog_push(prog, INSN(WRITE, IMM(AR8327_HIGH_ADDR_PHY),
++				  IMM(AR8327_HIGH_ADDR_REG), IMM(page)));
++	mdio_prog_push(prog, INSN(READ,  IMM(AR8327_DATA_PHY_BASE | r2),
++				  IMM(r1 + adev->high_half), REG(0)));
++	return 0;
++}
++
++int ar8327_write(struct mdio_device *dev, struct mdio_prog *prog,
++		 uint32_t reg, uint32_t val)
++{
++	struct ar8327_device *adev = (void *)dev;
++	uint16_t r1, r2, page;
++
++	ar8327_split_addr(reg, &r1, &r2, &page);
++
++	mdio_prog_push(prog, INSN(WRITE, IMM(AR8327_HIGH_ADDR_PHY),
++				  IMM(AR8327_HIGH_ADDR_REG), IMM(page)));
++	mdio_prog_push(prog, INSN(WRITE, IMM(AR8327_DATA_PHY_BASE | r2),
++				  IMM(r1 + adev->high_half),
++				  IMM(val & 0xffff)));
++	return 0;
++}
++
++static const struct mdio_driver ar8327_driver = {
++	.read  = ar8327_read,
++	.write = ar8327_write,
++};
++
++int ar8327_exec(const char *bus, int argc, char **argv)
++{
++	struct ar8327_device adev = {
++		.dev = {
++			.bus    = bus,
++			.driver = &ar8327_driver,
++
++			.mem = {
++				/*
++				 * 4-byte stride:
++				 * register map directly (0x0000, 0x0004, ...).
++				 * Max address: 0x3FFFC (reg[17:0], 4-byte aligned).
++				 */
++				.max    = 0x3FFFC,
++				.stride = 4,
++				.width  = 16,
++			},
++		},
++		.high_half = 0,  /* default: lo */
++	};
++
++	/* Optional 'hi' or 'lo' argument selects which 16-bit half to access */
++	char *arg = argv_peek(argc, argv);
++	if (arg && !strcmp(arg, "lo")) {
++		adev.high_half = 0;
++		argv_pop(&argc, &argv);
++	} else if (arg && !strcmp(arg, "hi")) {
++		adev.high_half = 1;
++		argv_pop(&argc, &argv);
++	}
++
++	return mdio_common_exec(&adev.dev, argc, argv);
++}
++DEFINE_CMD("ar8327",  ar8327_exec);
++
++#define qca8k_exec ar8327_exec
++DEFINE_CMD("qca8k", qca8k_exec);
+-- 
+2.43.0
+
