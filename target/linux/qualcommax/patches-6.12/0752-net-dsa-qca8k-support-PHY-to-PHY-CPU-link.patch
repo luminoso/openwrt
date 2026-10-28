@@ -23,7 +23,7 @@ Signed-off-by: Ziyang Huang <hzyitc@outlook.com>
  			continue;
  
  		of_get_phy_mode(port, &mode);
-@@ -1089,17 +1089,19 @@ qca8k_setup_mac_pwr_sel(struct qca8k_pri
+@@ -1084,17 +1084,19 @@ qca8k_setup_mac_pwr_sel(struct qca8k_pri
  
  static int qca8k_find_cpu_port(struct dsa_switch *ds)
  {
